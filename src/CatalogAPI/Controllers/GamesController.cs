@@ -1,3 +1,4 @@
+using System.ComponentModel.DataAnnotations;
 using FiapCloudGames.Contracts;
 using CatalogAPI.Data;
 using MassTransit;
@@ -18,8 +19,8 @@ public sealed class GamesController(CatalogDbContext db, IPublishEndpoint bus) :
 
         return Ok(games.Select(g =>
         {
-            var p = promos.FirstOrDefault(x => x.GameId == g.Id);
-            return new { g.Id, g.Name, Price = p is null ? g.Price : g.Price * (100 - p.DiscountPercent) / 100, PromotionActive = p is not null };
+            var p = promos.Where(x => x.GameId == g.Id).OrderByDescending(x => x.DiscountPercent).FirstOrDefault();
+            return new { g.Id, g.Name, Price = p is null ? g.Price : decimal.Round(g.Price * (100 - p.DiscountPercent) / 100, 2, MidpointRounding.AwayFromZero), PromotionActive = p is not null };
         }));
     }
 
@@ -33,56 +34,61 @@ public sealed class GamesController(CatalogDbContext db, IPublishEndpoint bus) :
     }
 
     [Authorize(Roles = "Admin"), HttpPut("{id:int}")]
-    public async Task<IActionResult> Update(int id, GameRequest r) 
-    { 
-        var g = await db.Games.FindAsync(id); 
+    public async Task<IActionResult> Update(int id, GameRequest r)
+    {
+        var g = await db.Games.FindAsync(id);
 
-        if (g is null) 
-            return NotFound(); 
+        if (g is null)
+            return NotFound();
 
-        g.Name = r.Name; g.Price = r.Price; 
+        g.Name = r.Name; g.Price = r.Price;
 
-        await db.SaveChangesAsync(); 
+        await db.SaveChangesAsync();
 
-        return NoContent(); 
+        return NoContent();
     }
 
-    [Authorize(Roles = "Admin"), HttpDelete("{id:int}")] 
-    public async Task<IActionResult> Delete(int id) 
-    { 
-        var g = await db.Games.FindAsync(id); 
+    [Authorize(Roles = "Admin"), HttpDelete("{id:int}")]
+    public async Task<IActionResult> Delete(int id)
+    {
+        var g = await db.Games.FindAsync(id);
 
-        if (g is null) 
-            return NotFound(); 
+        if (g is null)
+            return NotFound();
 
-        db.Remove(g); 
+        if (await db.Orders.AnyAsync(x => x.GameId == id) || await db.Library.AnyAsync(x => x.GameId == id))
+            return Conflict("Jogo possui compras e nao pode ser removido");
+        db.Remove(g);
 
-        await db.SaveChangesAsync(); 
+        await db.SaveChangesAsync();
 
-        return NoContent(); 
+        return NoContent();
     }
 
-    [Authorize, HttpPost("{id:int}/purchase")] 
-    public async Task<IActionResult> Purchase(int id) 
-    { 
-        var g = await db.Games.FindAsync(id); 
+    [Authorize, HttpPost("{id:int}/purchase")]
+    public async Task<IActionResult> Purchase(int id)
+    {
+        var g = await db.Games.FindAsync(id);
 
-        if (g is null) 
-            return NotFound(); 
-        
-        var uid = int.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!); 
-        
-        if (await db.Library.AnyAsync(x => x.UserId == uid && x.GameId == id)) 
-            return Conflict("Jogo ja pertence ao usuario"); 
-        
-        var o = new Order { UserId = uid, GameId = id, Price = g.Price }; 
-        
-        db.Add(o); 
-        
-        await db.SaveChangesAsync(); 
-        
-        await bus.Publish(new OrderPlacedEvent(o.Id, o.UserId, o.GameId, o.Price)); 
-        
+        if (g is null)
+            return NotFound();
+
+        var uid = int.Parse(User.FindFirstValue(ClaimTypes.NameIdentifier)!);
+
+        if (await db.Library.AnyAsync(x => x.UserId == uid && x.GameId == id))
+            return Conflict("Jogo ja pertence ao usuario");
+
+        var now = DateTime.UtcNow;
+        var promotion = await db.Promotions.Where(p => p.GameId == id && p.Active && p.StartsAt <= now && p.EndsAt >= now).OrderByDescending(p => p.DiscountPercent).FirstOrDefaultAsync();
+        var price = promotion is null ? g.Price : decimal.Round(g.Price * (100 - promotion.DiscountPercent) / 100, 2, MidpointRounding.AwayFromZero);
+        var o = new Order { UserId = uid, GameId = id, Price = price };
+
+        db.Add(o);
+
+        await db.SaveChangesAsync();
+
+        await bus.Publish(new OrderPlacedEvent(o.Id, o.UserId, o.GameId, o.Price));
+
         return Accepted(new { o.Id, o.Status }); }
 }
-public sealed record GameRequest(string Name, decimal Price);
+public sealed record GameRequest([Required, StringLength(200, MinimumLength = 1)] string Name, [Range(typeof(decimal), "0.01", "1000000", ParseLimitsInInvariantCulture = true, ConvertValueInInvariantCulture = true)] decimal Price);

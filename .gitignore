@@ -1,5 +1,9 @@
 bin/
 obj/
 .vs/
-data/
+# Ignore SQLite files, never the Data source directory.
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
 *.user
