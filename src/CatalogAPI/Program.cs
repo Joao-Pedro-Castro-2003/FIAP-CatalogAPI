@@ -1,6 +1,7 @@
 using CatalogAPI.Data;
 using CatalogAPI.Messaging;
 using CatalogAPI.Reviews;
+using CatalogAPI.Search;
 using MassTransit;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
@@ -15,20 +16,40 @@ b.Services.AddControllers();
 b.Services.AddEndpointsApiExplorer();
 b.Services.AddSwaggerGen();
 b.Services.AddProblemDetails();
-b.Services.AddDbContext<CatalogDbContext>(o => o.UseSqlite(b.Configuration.GetConnectionString("Db")));
-b.Services.AddSingleton<IMongoClient>(_ => new MongoClient(b.Configuration["Mongo:ConnectionString"] ?? "mongodb://localhost:27017/?serverSelectionTimeoutMS=3000"));
+var postgres = b.Configuration["Database:Provider"] == "PostgreSQL";
+var connection = b.Configuration.GetConnectionString("Db") ?? throw new InvalidOperationException("ConnectionStrings:Db ausente");
+b.Services.AddDbContext<CatalogDbContext>(options =>
+{
+    if (postgres)
+        options.UseNpgsql(connection);
+    else
+        options.UseSqlite(connection);
+});
+b.Services.AddSingleton<IMongoClient>(_ => new MongoClient(b.Configuration["Mongo:ConnectionString"] ?? throw new InvalidOperationException("Mongo:ConnectionString ausente")));
 b.Services.AddSingleton<IReviewStore, MongoReviewStore>();
 b.Services.AddStackExchangeRedisCache(o => {
-    o.Configuration = b.Configuration["Redis:ConnectionString"] ?? "localhost:6379,abortConnect=false,connectTimeout=1000,syncTimeout=1000,asyncTimeout=1000";
+    o.Configuration = b.Configuration["Redis:ConnectionString"] ?? throw new InvalidOperationException("Redis:ConnectionString ausente");
     o.InstanceName = "fcg:";
 });
 b.Services.AddScoped<ReviewService>();
+var searchUrl = b.Configuration["Search:Url"];
+b.Services.AddHttpClient<GameSearchIndex>(client =>
+{
+    if (!string.IsNullOrWhiteSpace(searchUrl))
+        client.BaseAddress = new Uri(searchUrl.TrimEnd('/') + "/");
+    client.Timeout = TimeSpan.FromSeconds(10);
+    var authorization = b.Configuration["Search:Authorization"];
+    if (!string.IsNullOrWhiteSpace(authorization))
+        client.DefaultRequestHeaders.Authorization = System.Net.Http.Headers.AuthenticationHeaderValue.Parse(authorization);
+});
+if (!string.IsNullOrWhiteSpace(searchUrl))
+    b.Services.AddHostedService<GameIndexWorker>();
 b.Services.AddMassTransit(x => {
     x.AddConsumer<PaymentProcessedConsumer>();
     x.UsingRabbitMq((c, q) => {
         q.Host(b.Configuration["RabbitMq:Host"] ?? "localhost", h => {
-            h.Username(b.Configuration["RabbitMq:Username"] ?? "guest");
-            h.Password(b.Configuration["RabbitMq:Password"] ?? "guest");
+            h.Username(b.Configuration["RabbitMq:Username"] ?? throw new InvalidOperationException("Configuração RabbitMQ ausente"));
+            h.Password(b.Configuration["RabbitMq:Password"] ?? throw new InvalidOperationException("Configuração RabbitMQ ausente"));
         });
         q.ReceiveEndpoint("catalog-payment-processed", e => {
             e.ConcurrentMessageLimit = 1;
@@ -48,7 +69,19 @@ b.Services.AddAuthorization();
 var app = b.Build();
 Directory.CreateDirectory("data");
 using (var scope = app.Services.CreateScope())
-    scope.ServiceProvider.GetRequiredService<CatalogDbContext>().Database.EnsureCreated();
+{
+    var db = scope.ServiceProvider.GetRequiredService<CatalogDbContext>();
+    if (postgres)
+    {
+        db.Database.OpenConnection();
+        db.Database.ExecuteSqlRaw("SELECT pg_advisory_lock(42001)");
+    }
+    db.Database.EnsureCreated();
+    if (!string.IsNullOrWhiteSpace(searchUrl))
+        GameIndexWorker.Prepare(db);
+    if (postgres)
+        db.Database.ExecuteSqlRaw("SELECT pg_advisory_unlock(42001)");
+}
 app.UseRouting();
 app.UseHttpMetrics();
 app.UseExceptionHandler();

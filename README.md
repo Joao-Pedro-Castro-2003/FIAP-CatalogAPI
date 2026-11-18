@@ -28,3 +28,9 @@ dotnet test CatalogAPI.sln
 ```
 
 Os testes cobrem persistência SQLite, desconto, resultados repetidos de pagamento e cache/fallback com doubles. A validação real de MongoDB/Redis é feita por Test-Flow.ps1 após subir os containers. Consulte os limites de consistência e mensageria no guia central.
+
+## Busca da Fase 4
+
+`GET /search?q=termo&size=20` exige JWT e ordena por relevância com tolerância a erros de digitação. Os resultados contêm o preço base indexado. Alterações do catálogo chegam ao índice de forma assíncrona.
+
+Configure `Search__Url` com o endereço do serviço de busca. Se necessário, injete `Search__Authorization` como Secret, com o esquema exigido pelo serviço.
