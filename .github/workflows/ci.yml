@@ -1,0 +1,62 @@
+name: Build and test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: dotnet build CatalogAPI.sln --configuration Release
+      - run: dotnet test CatalogAPI.sln --configuration Release --no-build
+      - run: docker build --tag fcg-catalogapi:${{ github.sha }} .
+
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_AWS == 'true'
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: production-catalog-api
+      cancel-in-progress: false
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      EKS_CLUSTER: ${{ vars.EKS_CLUSTER }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ vars.AWS_REGION }}
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE }}
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Publish image
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+          image="$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA"
+          docker build --tag "$image" .
+          docker push "$image"
+          echo "DEPLOY_IMAGE=$image" >> "$GITHUB_ENV"
+      - name: Update Kubernetes
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --region "$AWS_REGION" --name "$EKS_CLUSTER"
+          strategy="$(kubectl -n fiap-cloud-games get deployment catalog-api -o jsonpath='{.spec.strategy.type}')"
+          test "$strategy" = RollingUpdate
+          kubectl -n fiap-cloud-games set image deployment/catalog-api catalog-api="$DEPLOY_IMAGE"
+          kubectl -n fiap-cloud-games rollout status deployment/catalog-api --timeout=300s
